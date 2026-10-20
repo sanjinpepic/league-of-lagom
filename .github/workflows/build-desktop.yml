@@ -71,11 +71,12 @@ jobs:
         include:
           - os: windows-latest
             args: --win nsis portable --x64
-          - os: macos-latest
+          - os: macos-14   # a pinned image: macos-latest has sat in the queue without a runner
             args: --mac dmg zip --x64 --arm64
           - os: ubuntu-latest
             args: --linux AppImage --x64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -105,6 +106,8 @@ jobs:
 
   publish:
     needs: [prepare, build]
+    # publish whatever built: one platform stuck in the queue must not hold back the others' update
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Publish the release (the app's auto-updater and the website only see published releases)
