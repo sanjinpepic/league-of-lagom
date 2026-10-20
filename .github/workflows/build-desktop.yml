@@ -1,0 +1,116 @@
+# Builds the League of Lagom desktop client for Windows, macOS and Linux and publishes the installers as a release of
+# THIS repo. Runs here (a public repo) because Actions minutes are free for public repos.
+# Only the desktop/ folder of the private game repo is fetched, at build time, and nothing from it is committed here.
+# One-time setup: a fine-grained token with Contents: Read-only on sanjinpepic/STUPMMO, stored in THIS repo as the
+# secret SOURCE_TOKEN (Settings -> Secrets and variables -> Actions).
+name: Build desktop client
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (X.Y.Z). Empty = the version in desktop/package.json'
+        required: false
+      source_ref:
+        description: 'Branch / tag / commit of sanjinpepic/STUPMMO to build'
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: sanjinpepic/STUPMMO
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Check the source token
+        env:
+          T: ${{ secrets.SOURCE_TOKEN }}
+        run: if [ -z "$T" ]; then echo "::error::The SOURCE_TOKEN secret is missing (see the comment at the top of this workflow)"; exit 1; fi
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: desktop
+          path: src
+      - id: v
+        name: Work out the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then V="$INPUT_VERSION"; else V="$(node -p "require('./src/desktop/package.json').version")"; fi
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then echo "::error::Bad version '$V'"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          if gh release view "v$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$V already exists; assets will be added/overwritten."
+          else
+            gh release create "v$V" -R "$GITHUB_REPOSITORY" --draft --title "League of Lagom $V" \
+              --notes "League of Lagom desktop client $V. Windows: League-of-Lagom-Setup-$V.exe (SmartScreen: More info → Run anyway). macOS: the .dmg for your chip (first launch: right-click → Open). Linux: the .AppImage (chmod +x)."
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --win nsis portable --x64
+          - os: macos-latest
+            args: --mac dmg zip --x64 --arm64
+          - os: ubuntu-latest
+            args: --linux AppImage --x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: desktop
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/desktop/package-lock.json
+      - run: npm ci
+      - name: Stamp the version
+        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version --allow-same-version
+      - name: Build and upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'   # unsigned builds (no Apple / Windows certificates yet)
+        run: npx electron-builder ${{ matrix.args }} --publish always
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release (the app's auto-updater and the website only see published releases)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release edit "v$V" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release view "v$V" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
